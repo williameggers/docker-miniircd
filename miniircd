@@ -1,0 +1,2399 @@
+#!/usr/bin/env python3
+#
+# Copyright (C) 2003-2021 Joel Rosdahl
+# Copyright (C) 2021 Bob Mottram
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# Joel Rosdahl <joel@rosdahl.net>
+# Bob Mottram <bob@libreserver.org>
+
+import logging
+import os
+import re
+import select
+import socket
+import string
+import sys
+import tempfile
+import time
+import hashlib
+import binascii
+
+from argparse import ArgumentParser, Namespace
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from typing import Any, Collection, Dict, List, Optional, Sequence, Set
+
+Socket = socket.socket
+
+VERSION = "2.2"
+
+
+def password_salt() -> str:
+    return hashlib.sha256(os.urandom(60)).hexdigest()
+
+
+def password_hash(salt: str, password: str) -> str:
+    pwdhash = hashlib.pbkdf2_hmac('sha512',
+                                  password.encode('utf-8'),
+                                  salt.encode('utf-8'), 100000)
+    pwdhash = binascii.hexlify(pwdhash)
+    return pwdhash.decode('ascii')
+
+
+def create_directory(path: str) -> None:
+    if not os.path.isdir(path):
+        os.makedirs(path)
+
+
+class Channel:
+    def __init__(self, server: "Server", name: bytes) -> None:
+        self.server = server
+        self.name = name
+        self.members: Set["Client"] = set()
+        self._topic = b""
+        self._key: Optional[bytes] = None
+        self._state_path: Optional[str]
+        if self.server.state_dir:
+            fs_safe_name = (
+                name.decode(errors="ignore")
+                .replace("_", "__")
+                .replace("/", "_")
+            )
+            self._state_path = f"{self.server.state_dir}/{fs_safe_name}"
+            self._read_state()
+        else:
+            self._state_path = None
+
+    def add_member(self, client: "Client") -> bool:
+        if self.server.total_members < self.server.max_clients:
+            if len(self.members) < self.server.max_clients:
+                self.members.add(client)
+                self.server.total_members += 1
+                return True
+        return False
+
+    @property
+    def topic(self) -> bytes:
+        return self._topic
+
+    @topic.setter
+    def topic(self, value: bytes) -> None:
+        self._topic = value
+        self._write_state()
+
+    @property
+    def key(self) -> Optional[bytes]:
+        return self._key
+
+    @key.setter
+    def key(self, value: bytes) -> None:
+        self._key = value
+        self._write_state()
+
+    def remove_client(self, client: "Client") -> None:
+        self.members.discard(client)
+        self.server.total_members -= 1
+        if self.server.total_members < 0:
+            self.server.total_members = 0
+        if not self.members:
+            self.server.remove_channel(self.name)
+
+    def _read_state(self) -> None:
+        if not self._state_path:
+            return
+        if not os.path.exists(self.server.state_dir):
+            os.mkdir(self.server.state_dir)
+        if not os.path.exists(self._state_path):
+            return
+        data: Dict[str, Any] = {}
+
+        with open(self._state_path, "rb") as state_file:
+            exec(state_file.read(), {}, data)
+
+        self._topic = data.get("topic", "")
+        self._key = data.get("key")
+
+    def _write_state(self) -> None:
+        if not self._state_path:
+            return
+        if self.server.write_lock:
+            return
+        self.server.write_lock = True
+        try:
+            with open(self._state_path, "w+", encoding='utf-8') as state_file:
+                state_file.write("topic = %r\n" % self.topic)
+                state_file.write("key = %r\n" % self.key)
+        except OSError:
+            print('Unable to write state ' + str(self._state_path))
+            pass
+        self.server.write_lock = False
+
+
+class Client:
+    __linesep_regexp = re.compile(rb"\r?\n")
+    # The RFC limit for nicknames is 9 characters, but what the heck.
+    __valid_nickname_regexp = re.compile(
+        rb"^[][\`_^{|}A-Za-z][][\`_^{|}A-Za-z0-9-]{0,50}$"
+    )
+    __valid_channelname_regexp = re.compile(
+        rb"^[&#+!][^\x00\x07\x0a\x0d ,:]{0,50}$"
+    )
+
+    def __init__(self, server: "Server", socket: Socket) -> None:
+        self.server = server
+        self.socket = socket
+        # irc_lower(Channel name) --> Channel
+        self.channels: Dict[bytes, Channel] = {}
+        self.nickname = b""
+        self.spoofednickname = None
+        self.user = b""
+        self.realname = b""
+        self.is_operator = False
+        self.is_registered = False
+        if self.server.ipv6:
+            host, port, _, _ = socket.getpeername()
+        else:
+            host, port = socket.getpeername()
+        self.host = host.encode()
+        self.port = port
+        if self.server.cloak:
+            self.host = self.server.cloak.encode()
+        self.__last_message = int(time.time())
+        self.__flood_score = 0
+        self.__flood_time = 0
+        self.__bouncer_replay_active = False
+        self.__timestamp = time.time()
+        self.__readbuffer = b""
+        self.__writebuffer = b""
+        self.__sent_ping = False
+        self.__quiet = False
+        if self.server.password:
+            self.__handle_command = self.__pass_handler
+        else:
+            self.__handle_command = self.__registration_handler
+
+    @property
+    def prefix(self) -> bytes:
+        return b"%s!%s@%s" % (self.nickname, self.user, self.host)
+
+    @property
+    def oper(self) -> bool:
+        return self.is_operator
+
+    @property
+    def bouncer_replay_active(self) -> bool:
+        return self.__bouncer_replay_active
+
+    @bouncer_replay_active.setter
+    def bouncer_replay_active(self, value: bool) -> None:
+        self.__bouncer_replay_active = value
+
+    @oper.setter
+    def oper(self, value: bool) -> None:
+        if self.server.write_lock:
+            return
+        self.server.write_lock = True
+        lines = []
+        try:
+            with open(self.server.passwords_filename, 'r', encoding='utf-8') as fp:
+                fileStr = fp.read()
+                lines = fileStr.split('\n')
+        except OSError:
+            print('Unable to read oper password from ' +
+                  str(self.server.passwords_filename))
+            self.server.write_lock = False
+            return
+
+        if not lines:
+            self.server.write_lock = False
+            return
+
+        changed = False
+        nickStr = self.nickname.decode('utf-8')
+        for index in range(len(lines)):
+            line = lines[index]
+            if not line:
+                continue
+            if line.startswith(nickStr + ' '):
+                if value and not line.endswith(' oper'):
+                    lines[index] = line + ' oper'
+                    changed = True
+                elif not value and line.endswith(' oper'):
+                    lines[index] = line.replace(' oper', '')
+                    changed = True
+                break
+        if changed:
+            fileStr = ''
+            for line in lines:
+                if not line:
+                    continue
+                fileStr += line + '\n'
+            try:
+                with open(self.server.passwords_filename, 'w+', encoding='utf-8') as fp:
+                    fp.write(fileStr)
+            except OSError:
+                print('Unable to write password to ' +
+                      str(self.server.passwords_filename))
+                self.server.write_lock = False
+                return
+        self.is_operator = value
+        self.server.write_lock = False
+
+    @property
+    def quiet(self) -> bool:
+        return self.__quiet
+
+    @quiet.setter
+    def quiet(self, value: bool) -> None:
+        self.__quiet = value
+
+    def check_aliveness(self) -> None:
+        now = time.time()
+        if self.__timestamp + 180 < now:
+            self.disconnect("ping timeout")
+            return
+        if not self.__sent_ping and self.__timestamp + 90 < now:
+            if self.__handle_command == self.__command_handler:
+                # Registered.
+                self.message(b"PING :%s" % self.server.name)
+                self.__sent_ping = True
+            else:
+                # Not registered.
+                self.disconnect("ping timeout")
+
+    def write_queue_size(self) -> int:
+        return len(self.__writebuffer)
+
+    def __parse_read_buffer(self) -> None:
+        lines = self.__linesep_regexp.split(self.__readbuffer)
+        self.__readbuffer = lines[-1]
+        lines = lines[:-1]
+        for line in lines:
+            if not line:
+                # Empty line. Ignore.
+                continue
+            x = line.split(b" ", 1)
+            command = x[0].upper()
+            if len(x) == 1:
+                arguments = []
+            elif x[1].startswith(b":"):
+                arguments = [x[1][1:]]
+            else:
+                y = x[1].split(b" :", 1)
+                arguments = y[0].split()
+                if len(y) == 2:
+                    arguments.append(y[1])
+            self.__handle_command(command, arguments)
+
+    def __pass_handler(
+        self, command: bytes, arguments: Sequence[bytes]
+    ) -> None:
+        server = self.server
+        if command == b"PASS":
+            if len(arguments) == 0:
+                self.reply_461(b"PASS")
+            else:
+                if arguments[0].decode("utf-8") == server.password:
+                    self.__handle_command = self.__registration_handler
+                else:
+                    self.reply(b"464 :Password incorrect")
+        elif command == b"QUIT":
+            self.disconnect("Client quit")
+
+    def __registration_handler(
+        self, command: bytes, arguments: Sequence[bytes]
+    ) -> None:
+        server = self.server
+        if command == b"NICK":
+            if len(arguments) < 1:
+                self.reply(b"431 :No nickname given")
+                return
+            nick = arguments[0]
+            if server.get_client(nick):
+                self.reply(b"433 * %s :Nickname is already in use" % nick)
+            elif not self.__valid_nickname_regexp.match(nick):
+                self.reply(b"432 * %s :Erroneous nickname" % nick)
+            else:
+                self.nickname = nick
+                server.client_changed_nickname(self, None)
+        elif command == b"USER":
+            if len(arguments) < 4:
+                self.reply_461(b"USER")
+                return
+            self.user = arguments[0]
+            self.realname = arguments[3]
+        elif command == b"QUIT":
+            self.disconnect("Client quit")
+            return
+        if self.nickname and self.user:
+            self.reply(b"001 %s :Hi, welcome to IRC" % self.nickname)
+            self.reply(
+                b"002 %s :Your host is %s, running version miniircd-%s"
+                % (self.nickname, server.name, VERSION.encode())
+            )
+            self.reply(
+                b"003 %s :This server was created sometime" % self.nickname
+            )
+            self.reply(
+                b"004 %s %s miniircd-%s o o"
+                % (self.nickname, server.name, VERSION.encode())
+            )
+            self.send_lusers()
+            self.send_motd()
+            self.__handle_command = self.__command_handler
+
+    def __send_names(
+        self, arguments: Sequence[bytes], for_join: bool = False
+    ) -> None:
+        server = self.server
+        valid_channel_re = self.__valid_channelname_regexp
+        if len(arguments) > 0:
+            channelnames = arguments[0].split(b",")
+        else:
+            channelnames = sorted(self.channels.keys())
+        if len(arguments) > 1:
+            keys = arguments[1].split(b",")
+        else:
+            keys = []
+        for i, channelname in enumerate(channelnames):
+            if server.channel_is_banned(irc_lower(channelname)):
+                continue
+            if for_join and irc_lower(channelname) in self.channels:
+                continue
+            if not valid_channel_re.match(channelname):
+                self.reply_403(channelname)
+                continue
+            channel = server.get_channel(channelname)
+            if not channel:
+                self.reply(
+                    b"405 %s %s :Too many channels"
+                    % (self.nickname, channelname)
+                )
+                continue
+            elif channel.key is not None and \
+               (len(keys) <= i or channel.key != keys[i]):
+                self.reply(
+                    b"475 %s %s :Cannot join channel (+k) - bad key"
+                    % (self.nickname, channelname)
+                )
+                continue
+
+            if for_join:
+                if self.is_registered or not self.server.registered_only:
+                    if not server.nickname_is_banned(self.nickname):
+                        if channel.add_member(self):
+                            self.channels[irc_lower(channelname)] = channel
+                            self.message_channel(channel, b"JOIN", channelname, True)
+                            self.channel_log(channel, b"joined", meta=True)
+                            if channel.topic:
+                                self.reply(
+                                    b"332 %s %s :%s"
+                                    % (self.nickname, channel.name, channel.topic)
+                                )
+                            else:
+                                self.reply(
+                                    b"331 %s %s :No topic is set"
+                                    % (self.nickname, channel.name)
+                                )
+                            server.bouncer_replay(self.nickname)
+                        else:
+                            self.reply(
+                                b"404 %s %s :Maximum clients on server"
+                                % (self.nickname, channel.name)
+                            )
+                            continue
+                    else:
+                        self.reply(
+                            b"474 %s %s :Banned"
+                            % (self.nickname, channel.name)
+                        )
+                        continue
+                else:
+                    self.reply(
+                        b"451 %s %s :Not registered %s %s"
+                        % (self.nickname, channel.name, self.nickname, channel.name)
+                    )
+                    continue
+            names_prefix = b"353 %s = %s :" % (self.nickname, channelname)
+            names = b""
+            # Max length: reply prefix ":server_name(space)" plus CRLF in
+            # the end.
+            names_max_len = 512 - (len(server.name) + 2 + 2)
+            for name in sorted(x.nickname for x in channel.members):
+                if not names:
+                    names = names_prefix + name
+                # Using >= to include the space between "names" and "name".
+                elif len(names) + len(name) >= names_max_len:
+                    self.reply(names)
+                    names = names_prefix + name
+                else:
+                    names += b" " + name
+            if names:
+                self.reply(names)
+            self.reply(
+                b"366 %s %s :End of NAMES list" % (self.nickname, channelname)
+            )
+
+    def __register(self, nickname: str, salt: str, hashed_password: str, oper=False) -> bool:
+        if self.server.write_lock:
+            return False
+        if nickname.endswith('_'):
+            return False
+        self.server.write_lock = True
+        if not os.path.isfile(self.server.passwords_filename):
+            oper = True
+        line = nickname + ' ' + salt + ' ' + hashed_password
+        if oper:
+            line += ' oper'
+        writeMode = 'a+'
+        if not os.path.isfile(self.server.passwords_filename):
+            writeMode = 'w+'
+        try:
+            with open(self.server.passwords_filename, writeMode, encoding='utf-8') as fp:
+                fp.write(line + '\n')
+        except OSError:
+            print('Register password failed ' +
+                  str(self.server.passwords_filename) + ' ' + str(writeMode))
+            self.server.write_lock = False
+            return False
+        self.server.write_lock = False
+        return True
+
+    def __password_entry(self, nickname: str) -> str:
+        if not os.path.isfile(self.server.passwords_filename):
+            return None
+        lines = []
+        try:
+            with open(self.server.passwords_filename, 'r', encoding='utf-8') as fp:
+                lines = fp.readlines()
+        except OSError:
+            print('Unable to read passwords ' +
+                  str(self.server.passwords_filename))
+            return None
+        for line in lines:
+            if line.startswith(nickname + ' '):
+                return line
+        return None
+
+    def __get_salt(self, nickname: str) -> str:
+        line = self.__password_entry(nickname)
+        if not line:
+            return None
+        if ' ' not in line:
+            return None
+        return line.split(' ')[1]
+
+    def _constant_time_string_check(self, string1: str, string2: str) -> bool:
+        """Compares two string and returns if they are the same
+        using a constant amount of time
+        See https://sqreen.github.io/DevelopersSecurityBestPractices/
+        timing-attack/python
+        """
+        # strings must be of equal length
+        if len(string1) != len(string2):
+            return False
+        ctr = 0
+        matched = True
+        for ch in string1:
+            if ch != string2[ctr]:
+                matched = False
+            else:
+                # this is to make the timing more even
+                # and not provide clues
+                matched = matched
+            ctr += 1
+        return matched
+
+    def __is_op(self, nickname: str, salt: str, hashed_password: str) -> bool:
+        line = self.__password_entry(nickname)
+        if not line:
+            return False
+        expected = \
+            nickname + ' ' + salt + ' ' + hashed_password + ' oper\n'
+        return self._constant_time_string_check("{:<1024}".format(line),
+                                                "{:<1024}".format(expected))
+
+    def __is_registered(self, nickname: str, salt: str, hashed_password: str) -> bool:
+        line = self.__password_entry(nickname)
+        if not line:
+            return False
+        expected = \
+            nickname + ' ' + salt + ' ' + hashed_password + '\n'
+        return self._constant_time_string_check("{:<1024}".format(line),
+                                                "{:<1024}".format(expected))
+
+    def __identify(self, nickname: str, salt: str, hashed_password: str) -> int:
+        if self.__is_op(nickname, salt, hashed_password):
+            return 2
+        elif self.__is_registered(nickname, salt, hashed_password):
+            return 1
+        return 0
+
+    def register_account(self, password: str) -> bool:
+        if self.server.new_registrations <= 0:
+            self.reply(b"406 %s :New registrations closed" % (self.nickname))
+            return False
+        register_nick = self.nickname.decode('utf-8')
+        if register_nick.endswith('_'):
+            self.reply(
+                b"431 %s :Nick contains invalid characters"
+                % (self.nickname))
+            return False
+        salt = self.__get_salt(register_nick)
+        if salt:
+            self.reply(b"462 %s :Already registered" % (self.nickname))
+            return False
+        salt = password_salt()
+        hashed_password = password_hash(salt, password)
+        if not self.__register(register_nick, salt, hashed_password):
+            self.reply(b"424 %s :File error" % (self.nickname))
+            self.server.write_lock = False
+            return False
+        self.server.new_registrations -= 1
+        return True
+
+    def __msg_nickserv_identify(self, nickname: str, password: str) -> bool:
+        salt = self.__get_salt(nickname)
+        if not salt:
+            self.reply(b"406 %s :Not registered %s" % (self.nickname, self.nickname))
+            self.is_operator = False
+            self.is_registered = False
+            return False
+        hashed_password = password_hash(salt, password)
+        retval = self.__identify(nickname, salt, hashed_password)
+        if retval > 0:
+            self.is_registered = True
+        if retval > 1:
+            self.is_operator = True
+        if retval == 0:
+            self.is_operator = False
+            self.is_registered = False
+            self.reply(b"401 %s :No such nick" % self.nickname)
+            return False
+        self.server.remove_imposters(self, nickname.encode())
+        return True
+
+    def set_password(self, nickname: str, password: str) -> bool:
+        salt = self.__get_salt(nickname)
+        if not salt:
+            self.reply(b"406 %s :Not registered %s" % (self.nickname, self.nickname))
+            self.message((f"Not registered").encode())
+            self.server.write_lock = False
+            return False
+        hashed_password = password_hash(salt, password)
+        new_password_file = None
+        try:
+            with open(self.server.passwords_filename, 'r', encoding='utf-8') as fp:
+                lines = fp.readlines()
+                new_password_file = ''
+                for line in lines:
+                    if not line.endswith('\n'):
+                        line += '\n'
+                    new_line = line
+                    if line.startswith(nickname + ' ' + salt + ' '):
+                        new_line = nickname + ' ' + salt + ' ' + hashed_password
+                        if self.oper:
+                            new_line += ' oper'
+                        new_line += '\n'
+                    new_password_file += new_line
+        except OSError:
+            print('Unable to read passwords set ' +
+                  str(self.server.passwords_filename))
+            pass
+        if new_password_file:
+            try:
+                with open(self.server.passwords_filename, 'w+', encoding='utf-8') as fp:
+                    fp.write(new_password_file)
+            except OSError:
+                self.message((f"Failed to change password").encode())
+                self.server.write_lock = False
+                return False
+        self.message((f"Changed password").encode())
+        self.server.write_lock = False
+        return True
+
+    def __command_handler(
+        self, command: bytes, arguments: Sequence[bytes]
+    ) -> None:
+        def away_handler() -> None:
+            pass
+
+        def ison_handler() -> None:
+            if len(arguments) < 1:
+                self.reply_461(b"ISON")
+                return
+            nicks = arguments
+            online = [n for n in nicks if self.server.get_client(n)]
+            self.reply(b"303 %s :%s" % (self.nickname, b" ".join(online)))
+
+        def join_handler() -> None:
+            if len(arguments) < 1:
+                self.reply_461(b"JOIN")
+                return
+            if arguments[0] == b"0":
+                if not self.oper:
+                    self.reply(b"481 %s :Permission denied" % (self.nickname))
+                    return
+                for (channelname, channel) in self.channels.items():
+                    self.message_channel(channel, b"PART", channelname, True)
+                    self.channel_log(channel, b"left", meta=True)
+                    self.server.remove_member_from_channel(self, channelname)
+                self.channels = {}
+                return
+            self.__send_names(arguments, for_join=True)
+
+        def list_handler() -> None:
+            if len(arguments) < 1:
+                channels = list(self.server.channels.values())
+            else:
+                channels = []
+                for channelname in arguments[0].split(b","):
+                    if self.server.has_channel(channelname):
+                        channels.append(self.server.get_channel(channelname))
+
+            sorted_channels = sorted(channels, key=lambda x: x.name)
+            self.reply(b"321 %s :Start of LIST" % self.nickname)
+            for channel in sorted_channels:
+                self.reply(
+                    b"322 %s %s %d :%s"
+                    % (
+                        self.nickname,
+                        channel.name,
+                        len(channel.members),
+                        channel.topic,
+                    )
+                )
+            self.reply(b"323 %s :End of LIST" % self.nickname)
+
+        def history_handler() -> None:
+            self.server.bouncer_replay(self.nickname)
+
+        def filters_handler() -> None:
+            if not self.oper:
+                self.reply(b"481 %s :Filters list permission denied" % (self.nickname))
+                return
+            self.server.filters.sort()
+            for filter_pattern in self.server.filters:
+                if not filter_pattern:
+                    continue
+                self.message(filter_pattern.encode())
+            self.reply(b"349 %s :End of FILTERS" % self.nickname)
+
+        def bans_handler() -> None:
+            if not self.oper:
+                self.reply(b"481 %s :Bans list permission denied" % (self.nickname))
+                return
+            self.server.banned_nicknames.sort()
+            for ban in self.server.banned_nicknames:
+                if not ban:
+                    continue
+                self.reply(b"367 %s - %s -" % (self.nickname, ban))
+            self.reply(b"368 %s :End of BANS" % self.nickname)
+
+        def chanbans_handler() -> None:
+            if not self.oper:
+                self.reply(b"481 %s :Chanbans list permission denied" % (self.nickname))
+                return
+            self.server.dropped_channels.sort()
+            for ban in self.server.dropped_channels:
+                if not ban:
+                    continue
+                self.reply(b"367 %s - %s -" % (self.nickname, ban))
+            self.reply(b"368 %s :End of CHANBANS" % self.nickname)
+
+        def lusers_handler() -> None:
+            self.send_lusers()
+
+        def mode_handler() -> None:
+            if len(arguments) < 1:
+                self.reply_461(b"MODE")
+                return
+            targetname = arguments[0]
+            if self.server.has_channel(targetname):
+                if not self.oper:
+                    self.reply(b"481 %s :Mode change permission denied" % (self.nickname))
+                    return
+                channel = self.server.get_channel(targetname)
+                if len(arguments) < 2:
+                    if channel.key:
+                        modes = b"+k"
+                        if irc_lower(channel.name) in self.channels:
+                            modes += b" %s" % channel.key
+                    else:
+                        modes = b"+"
+                    self.reply(
+                        b"324 %s %s %s" % (self.nickname, targetname, modes)
+                    )
+                    return
+                flag = arguments[1]
+                if flag == b"+k":
+                    if len(arguments) < 3:
+                        self.reply_461(b"MODE")
+                        return
+                    key = arguments[2]
+                    if irc_lower(channel.name) in self.channels:
+                        channel.key = key
+                        self.message_channel(
+                            channel,
+                            b"MODE",
+                            b"%s +k %s" % (channel.name, key),
+                            True,
+                        )
+                        self.channel_log(
+                            channel, b"set channel key to %s" % key, meta=True
+                        )
+                    else:
+                        self.reply(
+                            b"442 %s :You're not on that channel" % targetname
+                        )
+                elif flag == b"-k":
+                    if irc_lower(channel.name) in self.channels:
+                        channel.key = None
+                        self.message_channel(
+                            channel, b"MODE", b"%s -k" % channel.name, True
+                        )
+                        self.channel_log(
+                            channel, b"removed channel key", meta=True
+                        )
+                    else:
+                        self.reply(
+                            b"442 %s :You're not on that channel" % targetname
+                        )
+                elif flag == b"+b":
+                    if len(arguments) < 4:
+                        self.reply_461(b"MODE")
+                        return
+                    if irc_lower(channel.name) in self.channels:
+                        banned_nick = arguments[3]
+                        if banned_nick not in self.server.banned_nicknames:
+                            self.message_channel(
+                                channel,
+                                b"MODE",
+                                b"%s +b %s" % (channel.name, banned_nick),
+                                True
+                            )
+                            self.server.ban(banned_nick)
+                            self.channel_log(
+                                channel, b"Banned %s" % banned_nick, meta=True
+                            )
+                elif flag == b"-b":
+                    if len(arguments) < 4:
+                        self.reply_461(b"MODE")
+                        return
+                    if irc_lower(channel.name) in self.channels:
+                        banned_nick = arguments[3]
+                        if banned_nick in self.server.banned_nicknames:
+                            self.message_channel(
+                                channel,
+                                b"MODE",
+                                b"%s -b %s" % (channel.name, banned_nick),
+                                True
+                            )
+                            self.server.unban(banned_nick)
+                            self.channel_log(
+                                channel,
+                                b"Removed ban on %s" % banned_nick,
+                                meta=True
+                            )
+                        else:
+                            self.reply(
+                                b"481 %s %s :Not on banned list"
+                                % (self.nickname, banned_nick)
+                            )
+                elif flag == b"+q":
+                    if len(arguments) < 4:
+                        self.reply_461(b"MODE")
+                        return
+                    if irc_lower(channel.name) in self.channels:
+                        quiet_nick = arguments[3]
+                        self.message_channel(
+                            channel,
+                            b"MODE",
+                            b"%s +q %s" % (channel.name, quiet_nick),
+                            True
+                        )
+                        client = server.get_client(quiet_nick)
+                        if client:
+                            if not client.oper:
+                                client.quiet = True
+                                self.channel_log(
+                                    channel, b"Quiet %s" % quiet_nick, meta=True
+                                )
+                elif flag == b"-q":
+                    if len(arguments) < 4:
+                        self.reply_461(b"MODE")
+                        return
+                    if irc_lower(channel.name) in self.channels:
+                        quiet_nick = arguments[3]
+                        self.message_channel(
+                            channel,
+                            b"MODE",
+                            b"%s -q %s" % (channel.name, quiet_nick),
+                            True
+                        )
+                        client = server.get_client(quiet_nick)
+                        if client:
+                            client.quiet = False
+                        self.channel_log(
+                            channel, b"Removed quiet on %s" % quiet_nick, meta=True
+                        )
+                elif flag == b"+o" or flag == b"+a":
+                    if len(arguments) < 4:
+                        self.reply_461(b"MODE")
+                        return
+                    if irc_lower(channel.name) in self.channels:
+                        newop_nick = arguments[3]
+                        self.message_channel(
+                            channel,
+                            b"MODE",
+                            b"%s +o %s" % (channel.name, newop_nick),
+                            True
+                        )
+                        client = server.get_client(newop_nick)
+                        if client:
+                            client.oper = True
+                            if client.oper:
+                                self.channel_log(
+                                    channel,
+                                    b"Set as operator %s" % newop_nick,
+                                    meta=True
+                                )
+                elif flag == b"-o" or flag == b"-a":
+                    if len(arguments) < 4:
+                        self.reply_461(b"MODE")
+                        return
+                    if irc_lower(channel.name) in self.channels:
+                        resign_nick = arguments[3]
+                        if resign_nick != self.nickname:
+                            return
+                        self.message_channel(
+                            channel,
+                            b"MODE",
+                            b"%s -o %s" % (channel.name, resign_nick),
+                            True
+                        )
+                        client = server.get_client(resign_nick)
+                        if client:
+                            client.oper = False
+                            if not client.oper:
+                                self.channel_log(
+                                    channel,
+                                    b"Operator %s resigned" % resign_nick,
+                                    meta=True
+                                )
+                elif flag == b"+M" or flag == b"+R":
+                    if irc_lower(channel.name) in self.channels:
+                        if not self.server.registered_only:
+                            self.server.registered_only = True
+                            self.message_channel(
+                                channel,
+                                b"MODE",
+                                b"%s +M" % (channel.name),
+                                True
+                            )
+                elif flag == b"-M" or flag == b"-R":
+                    if irc_lower(channel.name) in self.channels:
+                        if self.server.registered_only:
+                            self.server.registered_only = False
+                            self.message_channel(
+                                channel,
+                                b"MODE",
+                                b"%s -M" % (channel.name),
+                                True
+                            )
+                else:
+                    self.reply(
+                        b"472 %s %s :Unknown MODE flag" % (self.nickname, flag)
+                    )
+            elif targetname == self.nickname:
+                if len(arguments) == 1:
+                    self.reply(b"221 %s +" % self.nickname)
+                else:
+                    self.reply(b"501 %s :Unknown MODE flag" % self.nickname)
+            else:
+                self.reply_403(targetname)
+
+        def motd_handler() -> None:
+            self.send_motd()
+
+        def names_handler() -> None:
+            self.__send_names(arguments)
+
+        def drop_handler() -> None:
+            if len(arguments) < 1:
+                self.reply_461(b"DROP")
+                return
+            if not self.oper:
+                self.reply(b"481 %s :Permission denied" % (self.nickname))
+                return
+            channelname = irc_lower(arguments[0])
+            channel = self.server.get_channel(channelname)
+            if not channel:
+                self.reply(b"403 %s Channel not found %s" % (self.nickname, channelname))
+                return
+            for client in self.server.clients.values():
+                self.server.remove_member_from_channel(client, channelname)
+            self.server.drop_channel(channelname)
+            self.reply(b"403 %s Channel dropped %s" % (self.nickname, channelname))
+
+        def nick_handler() -> None:
+            if len(arguments) < 1:
+                self.reply(b"431 :No nickname given")
+                return
+            newnick = arguments[0]
+            client = self.server.get_client(newnick)
+            if newnick == self.nickname:
+                pass
+            elif client and client is not self:
+                self.reply(
+                    b"433 %s %s :Nickname is already in use"
+                    % (self.nickname, newnick)
+                )
+            elif not self.__valid_nickname_regexp.match(newnick):
+                self.reply(
+                    b"432 %s %s :Erroneous Nickname" % (self.nickname, newnick)
+                )
+            else:
+                for x in self.channels.values():
+                    self.channel_log(
+                        x, b"changed nickname to %s" % newnick, meta=True
+                    )
+                oldnickname = self.nickname
+                self.nickname = newnick
+                if self.is_registered:
+                    self.message(b"Unregistered")
+                self.is_operator = False
+                self.is_registered = False
+                self.quiet = False
+                self.server.client_changed_nickname(self, oldnickname)
+                self.message_related(
+                    b":%s!%s@%s NICK %s"
+                    % (oldnickname, self.user, self.host, self.nickname),
+                    True,
+                )
+
+        def kick_handler() -> None:
+            if not self.oper:
+                self.reply(b"481 %s :Permission denied" % (self.nickname))
+                return
+            if len(arguments) < 2:
+                self.reply_461(b"KICK")
+                return
+            kicknick = arguments[1]
+            if kicknick == self.nickname:
+                pass
+            kicknick = kicknick.decode('utf-8')
+            if '*' not in kicknick and '?' not in kicknick:
+                kickList = [kicknick.encode()]
+            else:
+                kickList = []
+                for client in self.server.clients.values():
+                    search_pattern = \
+                        kicknick.replace('*', '.+').replace('?', '.')
+                    nick = client.nickname.decode('utf-8')
+                    if re.search(search_pattern, nick):
+                        kickList.append(client.nickname)
+            for kicknick in kickList:
+                client = self.server.get_client(kicknick)
+                if not client:
+                    self.reply(b"401 %s %s :Nickname not found"
+                               % (self.nickname, kicknick))
+                    continue
+                if client is self:
+                    self.reply(
+                        b"433 %s %s :Nickname is already in use"
+                        % (self.nickname, kicknick)
+                    )
+                    continue
+                if client.oper:
+                    self.reply(
+                        b"481 %s %s :Permission denied"
+                        % (self.nickname, kicknick)
+                    )
+                    continue
+                reason = b'kicked'
+                if len(arguments) > 1:
+                    reason = b''
+                    for index in range(1, len(arguments)):
+                        if index > 1:
+                            reason += b' '
+                        reason += arguments[1]
+                self.server.remove_client(client, reason)
+
+        def register_handler() -> None:
+            if len(arguments) < 1:
+                self.reply_461(b"REGISTER")
+                return
+            password = arguments[0].decode('utf-8')
+            if self.register_account(password):
+                self.message((f"Register success").encode())
+            else:
+                self.message((f"Register failed").encode())
+
+        def newreg_handler() -> None:
+            if len(arguments) < 1:
+                self.reply_461(b"NEWREG")
+                return
+            if not self.oper:
+                self.reply(b"481 %s :Permission denied" % (self.nickname))
+                return
+            new_registrations = arguments[0].decode('utf-8')
+            if new_registrations.isdigit():
+                self.server.new_registrations = int(new_registrations)
+                self.message(b"New registrations: %s" % new_registrations.encode())
+
+        def setpassword_handler() -> None:
+            if self.server.write_lock:
+                return
+            self.server.write_lock = True
+            if len(arguments) < 1:
+                self.reply_461(b"SETPASSWORD")
+                self.server.write_lock = False
+                return
+            if not self.oper:
+                if not self.is_registered:
+                    self.reply(b"406 %s :Not registered %s" % (self.nickname, self.nickname))
+                    self.message((f"Not registered").encode())
+                    self.server.write_lock = False
+                    return
+            self.set_password(self.nickname.decode('utf-8'), arguments[0].decode('utf-8'))
+
+        def identify_handler() -> None:
+            if int(time.time()) - self.server.last_login_failure < 3:
+                # impose a minimum time between login failures
+                # to mitigate brute force attempts
+                return
+            if len(arguments) < 1:
+                self.reply_461(b"IDENTIFY")
+                self.is_operator = False
+                self.is_registered = False
+                return
+            if len(arguments) == 2:
+                self.message((f"Full credentials provided").encode())
+                nickname = arguments[0].decode('utf-8')
+                password = arguments[1].decode('utf-8')
+            else:
+                nickname = self.nickname.decode('utf-8')
+                password = arguments[-1].decode('utf-8')
+            if self.__msg_nickserv_identify(nickname, password):
+                self.message((f"Identify success").encode())
+            else:
+                self.server.last_login_failure = int(time.time())
+                self.message((f"Identify failed").encode())
+
+        def filter_handler() -> None:
+            if len(arguments) < 2:
+                self.reply_461(b"FILTER")
+                return
+            if not self.oper:
+                self.reply(b"481 %s :Permission denied" % (self.nickname))
+                self.message((f"Only operators can add filter patterns").encode())
+                return
+            filter_command = arguments[0].decode('utf-8').lower()
+            filterStr = ''
+            for index in range(1, len(arguments)):
+                if index > 1:
+                    filterStr += ' '
+                filterStr += arguments[index].decode('utf-8')
+            if filter_command == 'add':
+                self.server.add_filter(filterStr)
+            elif filter_command == 'remove' or \
+                 filter_command == 'rm' or \
+                 filter_command == 'delete':
+                self.server.remove_filter(filterStr)
+
+        def notice_and_privmsg_handler() -> None:
+            if len(arguments) == 0:
+                self.reply(
+                    b"411 %s :No recipient given (%s)"
+                    % (self.nickname, command)
+                )
+                return
+            if len(arguments) == 1:
+                self.reply(b"412 %s :No text to send" % self.nickname)
+                return
+            if self.__quiet:
+                self.reply(b"481 %s :You are muted" % (self.nickname))
+                return
+            targetname = arguments[0]
+            message = b''
+            for index in range(1, len(arguments)):
+                if index > 1:
+                    message += b' '
+                message += arguments[index]
+            client = self.server.get_client(targetname)
+            if client:
+                if not self.is_registered:
+                    self.reply(b"481 %s :Only registered users can send private messages" % (self.nickname))
+                    return
+                client.message(
+                    b":%s %s %s :%s"
+                    % (self.prefix, command, targetname, message)
+                )
+            elif self.server.has_channel(targetname):
+                channel = self.server.get_channel(targetname)
+                self.message_channel(
+                    channel, command, b"%s :%s" % (channel.name, message)
+                )
+                self.channel_log(channel, message)
+            else:
+                self.reply(
+                    b"401 %s %s :No such nick/channel"
+                    % (self.nickname, targetname)
+                )
+
+        def relaymsg_handler() -> None:
+            if len(arguments) == 0:
+                self.reply(
+                    b"411 %s :No channel given (%s)"
+                    % (self.nickname, command)
+                )
+                return
+            if len(arguments) == 1:
+                self.reply(
+                    b"411 %s :No spoofed nickname given (%s)"
+                    % (self.nickname, command)
+                )
+                return
+            if len(arguments) == 2:
+                self.reply(
+                    b"411 %s :No message given (%s)"
+                    % (self.nickname, command)
+                )
+                return
+            if not self.oper:
+                self.reply(b"481 %s :Permission denied" % (self.nickname))
+                self.message((f"Only operators can relay messages").encode())
+                return
+            if self.__quiet:
+                self.reply(b"481 %s :You are muted" % (self.nickname))
+                return
+            if self.spoofednickname:
+                self.nickname = self.spoofednickname
+                self.spoofednickname = None
+            targetname = arguments[0]
+            spoofednickname = arguments[1]
+            message = b''
+            for index in range(2, len(arguments)):
+                if index > 2:
+                    message += b' '
+                message += arguments[index]
+            client = self.server.get_client(spoofednickname)
+            if client:
+                self.reply(b"481 %s :Conflicting spoofed client nickname" % (spoofednickname))
+                return
+            if self.server.has_channel(targetname):
+                channel = self.server.get_channel(targetname)
+                nickname = self.nickname
+                self.spoofednickname = self.nickname
+                self.nickname = spoofednickname
+                self.message_channel(
+                    channel, command, b"%s :%s" % (channel.name, message)
+                )
+                self.nickname = self.spoofednickname
+                self.spoofednickname = None
+                self.channel_log(channel, message)
+
+        def part_handler() -> None:
+            if len(arguments) < 1:
+                self.reply_461(b"PART")
+                return
+            if len(arguments) > 1:
+                partmsg = arguments[1]
+            else:
+                partmsg = self.nickname
+            for channelname in arguments[0].split(b","):
+                if not valid_channel_re.match(channelname):
+                    self.reply_403(channelname)
+                elif not irc_lower(channelname) in self.channels:
+                    self.reply(
+                        b"442 %s %s :You're not on that channel"
+                        % (self.nickname, channelname)
+                    )
+                else:
+                    channel = self.channels[irc_lower(channelname)]
+                    self.message_channel(
+                        channel,
+                        b"PART",
+                        b"%s :%s" % (channelname, partmsg),
+                        True,
+                    )
+                    self.channel_log(
+                        channel, b"left (%s)" % partmsg, meta=True
+                    )
+                    del self.channels[irc_lower(channelname)]
+                    self.server.remove_member_from_channel(self, channelname)
+
+        def ping_handler() -> None:
+            if len(arguments) < 1:
+                self.reply(b"409 %s :No origin specified" % self.nickname)
+                return
+            self.reply(b"PONG %s :%s" % (self.server.name, arguments[0]))
+
+        def pong_handler() -> None:
+            pass
+
+        def quit_handler() -> None:
+            if len(arguments) < 1:
+                quitmsg = self.nickname
+            else:
+                quitmsg = arguments[0]
+            self.disconnect(quitmsg.decode(errors="ignore"))
+
+        def topic_handler() -> None:
+            if len(arguments) < 1:
+                self.reply_461(b"TOPIC")
+                return
+            channelname = arguments[0]
+            channel = self.channels.get(irc_lower(channelname))
+
+            # if there is no topic then you can set it,
+            # otherwise you need oper status
+            topic_exists = False
+            if channel:
+                if channel.topic:
+                    topic_exists = True
+
+            if topic_exists and not self.oper:
+                self.reply(
+                    b"482 %s :Don't have permission to change topic"
+                    % (self.nickname)
+                )
+                return
+            if channel:
+                if len(arguments) > 1:
+                    newtopic = arguments[1]
+                    channel.topic = newtopic
+                    self.message_channel(
+                        channel,
+                        b"TOPIC",
+                        b"%s :%s" % (channelname, newtopic),
+                        True,
+                    )
+                    self.channel_log(
+                        channel, b"set topic to %r" % newtopic, meta=True
+                    )
+                else:
+                    if channel.topic:
+                        self.reply(
+                            b"332 %s %s :%s"
+                            % (self.nickname, channel.name, channel.topic)
+                        )
+                    else:
+                        self.reply(
+                            b"331 %s %s :No topic is set"
+                            % (self.nickname, channel.name)
+                        )
+            else:
+                self.reply(b"442 %s :You're not on that channel" % channelname)
+
+        def wallops_handler() -> None:
+            if len(arguments) < 1:
+                self.reply_461(b"WALLOPS")
+                return
+            if not self.oper:
+                self.reply(b"481 %s :Permission denied" % (self.nickname))
+                return
+            message = arguments[0]
+            for client in self.server.clients.values():
+                client.message(
+                    b":%s NOTICE %s :Global notice: %s"
+                    % (self.prefix, client.nickname, message)
+                )
+
+        def who_handler() -> None:
+            if len(arguments) < 1:
+                return
+            targetname = arguments[0]
+            if self.server.has_channel(targetname):
+                channel = self.server.get_channel(targetname)
+                for member in channel.members:
+                    self.reply(
+                        b"352 %s %s %s %s %s %s H :0 %s"
+                        % (
+                            self.nickname,
+                            targetname,
+                            member.user,
+                            member.host,
+                            self.server.name,
+                            member.nickname,
+                            member.realname,
+                        )
+                    )
+                self.reply(
+                    b"315 %s %s :End of WHO list" % (self.nickname, targetname)
+                )
+
+        def whois_handler() -> None:
+            if len(arguments) < 1:
+                return
+            username = arguments[0]
+            user = self.server.get_client(username)
+            if user:
+                self.reply(
+                    b"311 %s %s %s %s * :%s"
+                    % (
+                        self.nickname,
+                        user.nickname,
+                        user.user,
+                        user.host,
+                        user.realname,
+                    )
+                )
+                self.reply(
+                    b"312 %s %s %s :%s"
+                    % (self.nickname, user.nickname, self.server.name, self.server.name)
+                )
+                self.reply(
+                    b"319 %s %s :%s"
+                    % (
+                        self.nickname,
+                        user.nickname,
+                        b"".join(x + b" " for x in user.channels),
+                    )
+                )
+                self.reply(
+                    b"318 %s %s :End of WHOIS list"
+                    % (self.nickname, user.nickname)
+                )
+            else:
+                self.reply(
+                    b"401 %s %s :No such nick" % (self.nickname, username)
+                )
+
+        handler_table = {
+            b"AWAY": away_handler,
+            b"BANS": bans_handler,
+            b"CHANBANS": chanbans_handler,
+            b"DROP": drop_handler,
+            b"FILTER": filter_handler,
+            b"FILTERS": filters_handler,
+            b"HISTORY": history_handler,
+            b"IDENTIFY": identify_handler,
+            b"ISON": ison_handler,
+            b"JOIN": join_handler,
+            b"KICK": kick_handler,
+            b"LIST": list_handler,
+            b"LUSERS": lusers_handler,
+            b"MODE": mode_handler,
+            b"MOTD": motd_handler,
+            b"NAMES": names_handler,
+            b"NEWREG": newreg_handler,
+            b"NICK": nick_handler,
+            b"NOTICE": notice_and_privmsg_handler,
+            b"PART": part_handler,
+            b"PING": ping_handler,
+            b"PONG": pong_handler,
+            b"PRIVMSG": notice_and_privmsg_handler,
+            b"QUIT": quit_handler,
+            b"REGISTER": register_handler,
+            b"RELAYMSG": relaymsg_handler,
+            b"SETPASSWORD": setpassword_handler,
+            b"TOPIC": topic_handler,
+            b"WALLOPS": wallops_handler,
+            b"WHO": who_handler,
+            b"WHOIS": whois_handler,
+        }
+        server = self.server
+        valid_channel_re = self.__valid_channelname_regexp
+        try:
+            handler_table[command]()
+        except KeyError:
+            self.reply(
+                b"421 %s %s :Unknown command" % (self.nickname, command)
+            )
+
+    def socket_readable_notification(self) -> None:
+        try:
+            data = self.socket.recv(2 ** 10)
+            if self.server.debug:
+                host = self.host.decode(errors="ignore")
+                self.server.print_debug(f"[{host}:{self.port}] -> {data!r}")
+            quitmsg = "EOT"
+        except socket.error as e:
+            data = b""
+            quitmsg = str(e)
+        if data:
+            self.__readbuffer += data
+            self.__parse_read_buffer()
+            self.__timestamp = time.time()
+            self.__sent_ping = False
+        else:
+            self.disconnect(quitmsg)
+
+    def socket_writable_notification(self) -> None:
+        try:
+            sent = self.socket.send(self.__writebuffer)
+            if self.server.debug:
+                head = self.__writebuffer[:sent]
+                host = self.host.decode(errors="ignore")
+                self.server.print_debug(f"[{host}:{self.port}] <- {head!r}")
+            self.__writebuffer = self.__writebuffer[sent:]
+        except socket.error as x:
+            self.disconnect(str(x))
+
+    def disconnect(self, quitmsg: str) -> None:
+        self.message((f"ERROR :{quitmsg}").encode())
+        host = self.host.decode(errors="ignore")
+        self.server.print_info(
+            f"Disconnected connection from {host}:{self.port} ({quitmsg})."
+        )
+        self.socket.close()
+        self.server.remove_client(self, quitmsg.encode())
+
+    def message(self, msg: bytes) -> None:
+        self.__writebuffer += msg + b"\r\n"
+
+    def reply(self, msg: bytes) -> None:
+        self.message(b":%s %s" % (self.server.name, msg))
+
+    def reply_403(self, channel: bytes) -> None:
+        self.reply(b"403 %s %s :No such channel" % (self.nickname, channel))
+
+    def reply_461(self, command: bytes) -> None:
+        nickname = self.nickname or b"*"
+        self.reply(b"461 %s %s :Not enough parameters" % (nickname, command))
+
+    def message_channel(
+        self,
+        channel: Channel,
+        command: bytes,
+        message: bytes,
+        include_self: bool = False,
+    ) -> None:
+        if self.__flood_time > 0:
+            curr_time = int(time.time())
+            time_diff = curr_time - self.__flood_time
+            if time_diff < 240:
+                # reject messages for a while if flooding was detected
+                return
+            else:
+                print('Flood timeout ended for ' + self.nickname.decode('utf-8'))
+                self.__flood_time = 0
+                self.__flood_score = 0
+
+        if self.__quiet or self.server.message_filtered(message):
+            return
+
+        # flood detection
+        curr_time = int(time.time())
+        time_diff = curr_time - self.__last_message
+        self.__last_message = curr_time
+        if not self.__bouncer_replay_active and time_diff < 10:
+            if time_diff > 5:
+                self.__flood_score += 1
+            if time_diff < 3:
+                self.__flood_score += 3
+            else:
+                self.__flood_score += 2
+            if self.__flood_score >= self.server.max_flood_score:
+                self.__flood_time = curr_time
+                print('Flood detected from ' +
+                      self.nickname.decode('utf-8') +
+                      ' score=' + str(self.__flood_score))
+                return
+        else:
+            self.__flood_score = 0
+
+        line = b":%s %s %s" % (self.prefix, command, message)
+        self.server.update_bouncer(line)
+        for client in channel.members:
+            if client != self or include_self:
+                client.message(line)
+
+    def channel_log(
+        self, channel: Channel, message: bytes, meta: bool = False
+    ) -> None:
+        if not self.server.channel_log_dir:
+            return
+        if meta:
+            format_string = "[{}] * {} {}\n"
+        else:
+            format_string = "[{}] <{}> {}\n"
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        channel_name = irc_lower(channel.name).decode(errors="ignore")
+        logname = channel_name.replace("_", "__").replace("/", "_")
+        logfile = f"{self.server.channel_log_dir}/{logname}.log"
+        logmsg = format_string.format(timestamp, self.nickname, message)
+        with open(logfile, "a") as fp:
+            fp.write(logmsg)
+
+    def message_related(self, msg: bytes, include_self: bool = False) -> None:
+        clients = set()
+        if include_self:
+            clients.add(self)
+        for channel in self.channels.values():
+            clients |= channel.members
+        if not include_self:
+            clients.discard(self)
+        for client in clients:
+            client.message(msg)
+
+    def send_lusers(self) -> None:
+        self.reply(
+            b"251 %s :There are %d users and 0 services on 1 server"
+            % (self.nickname, len(self.server.clients))
+        )
+
+    def send_motd(self) -> None:
+        server = self.server
+        motdlines = server.get_motd_lines()
+        if motdlines:
+            self.reply(
+                b"375 %s :- %s Message of the day -"
+                % (self.nickname, server.name)
+            )
+            for line in motdlines:
+                self.reply(
+                    b"372 %s :- %s" % (self.nickname, line.rstrip().encode())
+                )
+            self.reply(b"376 %s :End of /MOTD command" % self.nickname)
+        else:
+            self.reply(b"422 %s :MOTD File is missing" % self.nickname)
+
+
+class Server:
+    def __init__(self, args: Namespace) -> None:
+        self.ports = args.ports
+        self.password = args.password
+        self.ssl_cert_file = args.ssl_cert_file
+        self.ssl_key_file = args.ssl_key_file
+        self.motdfile = args.motd
+        self.verbose = args.verbose
+        self.ipv6 = args.ipv6
+        self.debug = args.debug
+        self.channel_log_dir = args.channel_log_dir
+        self.chroot = args.chroot
+        self.setuid = args.setuid
+        self.state_dir = args.state_dir
+        self.log_file = args.log_file
+        self.log_max_bytes = args.log_max_size * 1024 * 1024
+        self.log_count = args.log_count
+        self.logger: Optional[logging.Logger] = None
+        self.cloak = args.cloak
+        self.max_clients = args.max_clients
+        self.max_channels = args.max_channels
+        self.passwords_filename = os.path.join(args.state_dir, 'passwords')
+        self.banned_filename = os.path.join(args.state_dir, 'banned')
+        self.dropped_channels_filename = os.path.join(args.state_dir, 'dropped')
+        self.filters_filename = os.path.join(args.state_dir, 'filters')
+        self.registered_only = args.registered_only
+        self.new_registrations = args.new_registrations
+        self.max_flood_score = args.max_flood_score
+        self.write_lock = False
+        self.banned_nicknames = []
+        self.dropped_channels = []
+        self.filters = []
+        self.bouncer = []
+        self.bouncer_size = args.bouncer_size
+        self.total_members = 0
+        self.name: bytes
+        self.last_login_failure = 0
+
+        if args.password_file:
+            with open(args.password_file, "r") as fp:
+                self.password = fp.read().strip("\n")
+
+        if self.ssl_key_file:
+            self.ssl = __import__("ssl")
+
+        # Find key/cert files after daemonization if path is relative:
+        if self.ssl_cert_file and os.path.exists(self.ssl_cert_file):
+            self.ssl_cert_file = os.path.abspath(self.ssl_cert_file)
+        if self.ssl_key_file and os.path.exists(self.ssl_key_file):
+            self.ssl_key_file = os.path.abspath(self.ssl_key_file)
+        # else: might exist in the chroot jail, so just continue
+
+        if args.listen and self.ipv6:
+            self.address = socket.getaddrinfo(
+                args.listen, None, proto=socket.IPPROTO_TCP
+            )[0][4][0]
+        elif args.listen:
+            self.address = socket.gethostbyname(args.listen)
+        else:
+            self.address = ""
+        server_name_limit = 63  # From the RFC.
+        self.name = socket.getfqdn(self.address)[:server_name_limit].encode()
+
+        self.channels: Dict[bytes, Channel] = {}  # key: irc_lower(channelname)
+        self.clients: Dict[Socket, Client] = {}
+        self.nicknames: Dict[bytes, Client] = {}  # key: irc_lower(nickname)
+        if self.channel_log_dir:
+            create_directory(self.channel_log_dir)
+        if self.state_dir:
+            create_directory(self.state_dir)
+
+        self._loadList(self.banned_nicknames, self.banned_filename, True)
+        self._loadList(self.filters, self.filters_filename, False)
+        self._loadList(self.dropped_channels, self.dropped_channels_filename, True)
+
+    def _loadList(self, lst: [], filename: str, encodeEntries: bool) -> None:
+        if not os.path.isfile(filename):
+            return
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                listStr = f.read()
+                loadedList = listStr.split('\n')
+                for entryStr in loadedList:
+                    if not entryStr:
+                        continue
+                    if encodeEntries:
+                        entryStr = entryStr.encode()
+                    if entryStr not in lst:
+                        lst.append(entryStr)
+        except OSError:
+            print('Unable to read list ' + str(filename))
+            pass
+
+    def _updateList(self, lst: [], filename: str, decode: bool) -> None:
+        if self.write_lock:
+            return
+        self.write_lock = True
+        listStr = ''
+        if not decode:
+            listStr = b''
+        for s in lst:
+            if decode:
+                listStr += s.decode('utf-8') + '\n'
+            else:
+                listStr += s + b'\n'
+        try:
+            with open(filename, 'w+', encoding='utf-8') as f:
+                f.write(listStr)
+        except OSError:
+            print('Unable to write list ' + str(filename))
+            pass
+        self.write_lock = False
+
+    def delete_account(self, nickname: str) -> bool:
+        removed = False
+        new_password_file = None
+        try:
+            with open(self.passwords_filename, 'r', encoding='utf-8') as fp:
+                lines = fp.readlines()
+                new_password_file = ''
+                for line in lines:
+                    if not line.endswith('\n'):
+                        line += '\n'
+                    new_line = line
+                    if line.startswith(nickname + ' '):
+                        if not line.endswith(' oper\n'):
+                            removed = True
+                            continue
+                    new_password_file += new_line
+        except OSError:
+            print('Unable to read passwords while deleting ' +
+                  str(self.passwords_filename))
+            pass
+        if not new_password_file or not removed:
+            self.write_lock = False
+            return False
+        try:
+            with open(self.passwords_filename, 'w+', encoding='utf-8') as fp:
+                fp.write(new_password_file)
+        except OSError:
+            print('Unable to write passwords while deleting ' +
+                  str(self.passwords_filename))
+            self.write_lock = False
+            return False
+        self.write_lock = False
+        return True
+
+    def account_is_operator(self, nickname: str) -> bool:
+        try:
+            with open(self.passwords_filename, 'r', encoding='utf-8') as fp:
+                lines = fp.readlines()
+                for line in lines:
+                    if not line.endswith('\n'):
+                        line += '\n'
+                    if line.startswith(nickname + ' '):
+                        if line.endswith(' oper\n'):
+                            return True
+        except OSError:
+            print('Unable to read passwords is oper ' +
+                  str(self.passwords_filename))
+            pass
+        return False
+
+    def remove_imposters(self, genuine, true_nickname: bytes) -> None:
+        curr_nickname = genuine.nickname
+        if curr_nickname == true_nickname:
+            genuine.message((f"No imposters").encode())
+            return
+        imposter = self.get_client(true_nickname)
+        if imposter:
+            genuine.message((f"Removing imposter").encode())
+            self.remove_client(imposter, b'imposter')
+            genuine.nickname = true_nickname
+            self.client_changed_nickname(genuine, curr_nickname)
+            genuine.message_related(
+                b":%s!%s@%s NICK %s"
+                % (curr_nickname, genuine.user, genuine.host, true_nickname),
+                True,
+            )
+
+    def update_bouncer(self, line: bytes) -> None:
+        if self.bouncer_size > 0:
+            self.bouncer.append(line)
+            while len(self.bouncer) >= self.bouncer_size:
+                self.bouncer.pop(0)
+
+    def bouncer_replay(self, nickname: bytes) -> None:
+        client = self.get_client(nickname)
+        if not client:
+            return
+        client.bouncer_replay_active = True
+        for line in self.bouncer:
+            client.message(line)
+        client.bouncer_replay_active = False
+
+    def message_filtered(self, message: bytes) -> bool:
+        messageStr = message.decode('utf-8')
+        for filter_pattern in self.filters:
+            match_message = \
+                filter_pattern.replace('*', '.+').replace('?', '.')
+            if re.search(match_message, messageStr):
+                return True
+        return False
+
+    def nickname_is_banned(self, nickname: bytes) -> bool:
+        if nickname in self.banned_nicknames:
+            return True
+        nicknameStr = nickname.decode('utf-8')
+        for nick in self.banned_nicknames:
+            if b'*' in nick or b'?' in nick:
+                search_pattern = nick.decode('utf-8')
+                if re.search(search_pattern, nicknameStr):
+                    return True
+        if self.message_filtered(nickname):
+            return True
+        return False
+
+    def channel_is_banned(self, channelname: bytes) -> bool:
+        if channelname in self.dropped_channels:
+            return True
+        channelnameStr = channelname.decode('utf-8')
+        for nick in self.banned_nicknames:
+            if b'*' in nick or b'?' in nick:
+                search_pattern = nick.decode('utf-8')
+                if re.search(search_pattern, channelnameStr):
+                    return True
+        if self.message_filtered(channelname):
+            return True
+        return False
+
+    def drop_channel(self, channelname: bytes) -> None:
+        if channelname not in self.dropped_channels:
+            self.dropped_channels.append(channelname)
+            self._updateList(self.dropped_channels, self.dropped_channels_filename, True)
+        self.remove_channel(channelname)
+
+    def ban(self, nickname: bytes) -> bool:
+        if nickname in self.banned_nicknames:
+            return True
+
+        nickStr = nickname.decode('utf-8')
+        if '*' not in nickStr and '?' not in nickStr:
+            client = self.get_client(nickname)
+            if client:
+                if client.oper:
+                    return False
+            elif self.account_is_operator(nickname):
+                return False
+            banList = [nickname]
+            self.banned_nicknames.append(nickname)
+        else:
+            self.banned_nicknames.append(nickname)
+            banList = []
+            for client in self.clients.values():
+                search_pattern = \
+                    nickStr.replace('*', '.+').replace('?', '.')
+                nick = client.nickname.decode('utf-8')
+                if re.search(search_pattern, nick):
+                    banList.append(client.nickname)
+        for nickname in banList:
+            client = self.get_client(nickname)
+            if client:
+                if not client.oper:
+                    self.remove_client(client, b'banned')
+            self.delete_account(nickname.decode('utf-8'))
+        self._updateList(self.banned_nicknames, self.banned_filename, True)
+        return True
+
+    def unban(self, nickname: bytes) -> None:
+        if nickname in self.banned_nicknames:
+            self.banned_nicknames.remove(nickname)
+        self._updateList(self.banned_nicknames, self.banned_filename, True)
+
+    def add_filter(self, filter_pattern: str) -> None:
+        filter_pattern = filter_pattern.replace('"', '')
+        if filter_pattern in self.filters:
+            return
+        self.filters.append(filter_pattern)
+        self._updateList(self.filters, self.filters_filename, False)
+
+    def remove_filter(self, filter_pattern: str) -> None:
+        filter_pattern = filter_pattern.replace('"', '')
+        if filter_pattern in self.filters:
+            self.filters.remove(filter_pattern)
+        self._updateList(self.filters, self.filters_filename, False)
+
+    def make_pid_file(self, filename: str) -> None:
+        try:
+            fd = os.open(filename, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+            os.write(fd, b"%i\n" % os.getpid())
+            os.close(fd)
+        except Exception:
+            self.print_error("Could not create PID file %r" % filename)
+            sys.exit(1)
+
+    def remove_pid_file(self, filename: str) -> None:
+        try:
+            os.remove(filename)
+        except Exception:
+            self.print_error("Could not remove PID file %r" % filename)
+
+    def daemonize(self) -> None:
+        try:
+            pid = os.fork()
+            if pid > 0:
+                sys.exit(0)
+        except OSError:
+            sys.exit(1)
+        os.setsid()
+        try:
+            pid = os.fork()
+            if pid > 0:
+                self.print_info("PID: %d" % pid)
+                sys.exit(0)
+        except OSError:
+            sys.exit(1)
+        os.chdir("/")
+        os.umask(0)
+        dev_null = open("/dev/null", "r+")
+        os.dup2(dev_null.fileno(), sys.stdout.fileno())
+        os.dup2(dev_null.fileno(), sys.stderr.fileno())
+        os.dup2(dev_null.fileno(), sys.stdin.fileno())
+
+    def get_client(self, nickname: bytes) -> Optional[Client]:
+        return self.nicknames.get(irc_lower(nickname))
+
+    def has_channel(self, name: bytes) -> bool:
+        return irc_lower(name) in self.channels
+
+    def get_channel(self, channelname: bytes) -> Channel:
+        if irc_lower(channelname) in self.channels:
+            channel = self.channels[irc_lower(channelname)]
+        else:
+            if len(self.channels.items()) < self.max_channels:
+                channel = Channel(self, channelname)
+                self.channels[irc_lower(channelname)] = channel
+            else:
+                channel = None
+        return channel
+
+    def get_motd_lines(self) -> Collection[str]:
+        if self.motdfile:
+            try:
+                return open(self.motdfile).readlines()
+            except IOError:
+                return ["Could not read MOTD file %r." % self.motdfile]
+        else:
+            return []
+
+    def print_info(self, msg: str) -> None:
+        if self.verbose:
+            print(msg)
+            sys.stdout.flush()
+        if self.logger:
+            self.logger.info(msg)
+
+    def print_debug(self, msg: str) -> None:
+        if self.debug:
+            print(msg)
+            sys.stdout.flush()
+            if self.logger:
+                self.logger.debug(msg)
+
+    def print_error(self, msg: str) -> None:
+        sys.stderr.write(f"{msg}\n")
+        if self.logger:
+            self.logger.error(msg)
+
+    def client_changed_nickname(
+        self, client: Client, oldnickname: Optional[bytes]
+    ) -> None:
+        if oldnickname:
+            del self.nicknames[irc_lower(oldnickname)]
+        self.nicknames[irc_lower(client.nickname)] = client
+
+    def remove_member_from_channel(
+        self, client: Client, channelname: bytes
+    ) -> None:
+        if irc_lower(channelname) in self.channels:
+            channel = self.channels[irc_lower(channelname)]
+            channel.remove_client(client)
+
+    def remove_client(self, client: Client, quitmsg: bytes) -> None:
+        client.message_related(b":%s QUIT :%s" % (client.prefix, quitmsg))
+        for x in client.channels.values():
+            client.channel_log(x, b"quit (%s)" % quitmsg, meta=True)
+            x.remove_client(client)
+        if client.nickname and irc_lower(client.nickname) in self.nicknames:
+            del self.nicknames[irc_lower(client.nickname)]
+        del self.clients[client.socket]
+
+    def remove_channel(self, channelname: bytes) -> None:
+        if irc_lower(channelname) in self.channels:
+            del self.channels[irc_lower(channelname)]
+
+    def start(self) -> None:
+        serversockets = []
+        for port in self.ports:
+            s = socket.socket(
+                socket.AF_INET6 if self.ipv6 else socket.AF_INET,
+                socket.SOCK_STREAM,
+            )
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((self.address, port))
+            except socket.error as e:
+                self.print_error(f"Could not bind port {port}: {e}.")
+                sys.exit(1)
+            s.listen(5)
+            serversockets.append(s)
+            del s
+            self.print_info(f"Listening on port {port}.")
+        if self.chroot:
+            os.chdir(self.chroot)
+            os.chroot(self.chroot)
+            self.print_info(f"Changed root directory to {self.chroot}")
+        if self.setuid:
+            os.setgid(self.setuid[1])
+            os.setuid(self.setuid[0])
+            self.print_info(
+                f"Setting uid:gid to {self.setuid[0]}:{self.setuid[1]}"
+            )
+
+        self.init_logging()
+        print('miniircd v' + VERSION)
+        try:
+            self.run(serversockets)
+        except Exception:
+            if self.logger:
+                self.logger.exception("Fatal exception")
+            raise
+
+    def init_logging(self) -> None:
+        if not self.log_file:
+            return
+
+        log_level = logging.INFO
+        if self.debug:
+            log_level = logging.DEBUG
+        self.logger = logging.getLogger("miniircd")
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s[%(process)d] - %(levelname)s - %(message)s"
+        )
+        fh = RotatingFileHandler(
+            self.log_file,
+            maxBytes=self.log_max_bytes,
+            backupCount=self.log_count,
+        )
+        fh.setLevel(log_level)
+        fh.setFormatter(formatter)
+        self.logger.setLevel(log_level)
+        self.logger.addHandler(fh)
+
+    def run(self, serversockets: List[Socket]) -> None:
+        last_aliveness_check = time.time()
+        last_connection_attempt = 0
+        while True:
+            iwtd, owtd, ewtd = select.select(
+                serversockets + [x.socket for x in self.clients.values()],
+                [
+                    x.socket
+                    for x in self.clients.values()
+                    if x.write_queue_size() > 0
+                ],
+                [],
+                10,
+            )
+            for x in iwtd:
+                if x in self.clients:
+                    self.clients[x].socket_readable_notification()
+                else:
+                    if int(time.time()) - last_connection_attempt < 3:
+                        continue
+                    if len(self.clients) >= self.max_clients:
+                        # avoid connection blocking by trying to remove
+                        # an unregistered client
+                        removeclient = None
+                        for y in self.clients:
+                            if not y.is_registered:
+                                removeclient = y
+                                break
+                        if removeclient:
+                            self.remove_client(removeclient, b'bye')
+                        if len(self.clients) >= self.max_clients:
+                            continue
+                    last_connection_attempt = int(time.time())
+                    conn, addr = x.accept()
+                    if self.ssl_key_file:
+                        try:
+                            conn = self.ssl.wrap_socket(
+                                conn,
+                                server_side=True,
+                                certfile=self.ssl_cert_file,
+                                keyfile=self.ssl_key_file,
+                            )
+                        except Exception as e:
+                            self.print_error(
+                                "SSL error for connection from"
+                                f" {addr[0]}:{addr[1]}: {e}"
+                            )
+                            continue
+                    try:
+                        self.clients[conn] = Client(self, conn)
+                        self.print_info(
+                            f"Accepted connection from {addr[0]}:{addr[1]}."
+                        )
+                    except socket.error:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+            for x in owtd:
+                if x in self.clients:  # client may have been disconnected
+                    self.clients[x].socket_writable_notification()
+            now = time.time()
+            if last_aliveness_check + 10 < now:
+                for client in list(self.clients.values()):
+                    client.check_aliveness()
+                last_aliveness_check = now
+
+
+_ircstring_translation = bytes.maketrans(
+    (string.ascii_lowercase.upper() + "[]\\^").encode(),
+    (string.ascii_lowercase + "{}|~").encode(),
+)
+
+
+def irc_lower(s: bytes) -> bytes:
+    return s.translate(_ircstring_translation)
+
+
+def main() -> None:
+    ap = ArgumentParser(
+        description="miniircd is a small and limited IRC server.",
+    )
+    ap.add_argument("--version", action="version", version=VERSION)
+    ap.add_argument(
+        "--channel-log-dir",
+        metavar="X",
+        help="store channel log in directory X",
+    )
+    ap.add_argument(
+        "-d", "--daemon", action="store_true", help="fork and become a daemon"
+    )
+    ap.add_argument("--ipv6", action="store_true", help="use IPv6")
+    ap.add_argument(
+        "--debug", action="store_true", help="print debug messages to stdout"
+    )
+    ap.add_argument(
+        "--listen", metavar="X", help="listen on specific IP address X"
+    )
+    ap.add_argument(
+        "--log-count",
+        metavar="X",
+        default=10,
+        type=int,
+        help="keep X log files; default: %(default)s",
+    )
+    ap.add_argument("--log-file", metavar="X", help="store log in file X")
+    ap.add_argument(
+        "--log-max-size",
+        metavar="X",
+        default=10,
+        type=int,
+        help="set maximum log file size to X MiB; default: %(default)s MiB",
+    )
+    ap.add_argument(
+        "--bouncer-size",
+        default=512,
+        type=int,
+        help="Bouncer buffer size",
+    )
+    ap.add_argument(
+        "--max-clients",
+        default=128,
+        type=int,
+        help="Maximum clients on the server",
+    )
+    ap.add_argument(
+        "--new-registrations",
+        default=128,
+        type=int,
+        help="Number of new registrations allowed",
+    )
+    ap.add_argument(
+        "--max-flood-score",
+        default=20,
+        type=int,
+        help="Maximum score for flood detection",
+    )
+    ap.add_argument(
+        "--max-channels",
+        default=8,
+        type=int,
+        help="Maximum number of channels",
+    )
+    ap.add_argument(
+        "--motd", metavar="X", help="display file X as message of the day"
+    )
+    ap.add_argument("--pid-file", metavar="X", help="write PID to file X")
+    ap.add_argument(
+        "-p",
+        "--password",
+        metavar="X",
+        help="require connection password X; default: no password",
+    )
+    ap.add_argument(
+        "--password-file",
+        metavar="X",
+        help=(
+            "require connection password stored in file X;"
+            " default: no password"
+        ),
+    )
+    ap.add_argument(
+        "--ports",
+        metavar="X",
+        help="listen to ports X (a list separated by comma or whitespace);"
+        " default: 6667 or 6697 if SSL is enabled",
+    )
+    ap.add_argument(
+        "--ssl-cert-file",
+        metavar="FILE",
+        help="enable SSL with PEM certificate in FILE",
+    )
+    ap.add_argument(
+        "--ssl-key-file",
+        metavar="FILE",
+        help="enable SSL with PEM key in FILE",
+    )
+    ap.add_argument(
+        "-s",
+        "--ssl-pem-file",
+        metavar="FILE",
+        help="enable SSL with key and certificate combined in FILE",
+    )
+    ap.add_argument(
+        "--state-dir",
+        metavar="X",
+        help="save persistent channel state (topic, key) in directory X",
+    )
+    ap.add_argument(
+        "--add-account",
+        metavar="X",
+        help="Adds an account with nickname:password",
+    )
+    ap.add_argument(
+        "--del-account",
+        metavar="X",
+        help="Deletes an account with the given nickname",
+    )
+    ap.add_argument(
+        "--set-password",
+        metavar="X",
+        help="Set password with nickname:newpassword",
+    )
+    ap.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Be verbose (print some progress messages to stdout)",
+    )
+    ap.add_argument(
+        "--registered-only",
+        action="store_true",
+        help="Only allow registered users within channels",
+    )
+    ap.add_argument(
+        "--cloak", metavar="X", help="report X as the host for all clients"
+    )
+    if os.name == "posix":
+        ap.add_argument(
+            "--chroot",
+            metavar="X",
+            help="change filesystem root to directory X after startup"
+            " (requires root)",
+        )
+        ap.add_argument(
+            "--setuid",
+            metavar="U[:G]",
+            help="change process user (and optionally group) after startup"
+            " (requires root)",
+        )
+
+    args = ap.parse_args()
+
+    if args.add_account:
+        if ':' not in args.add_account:
+            args.error("Specify nickname:password")
+        fields = args.add_account.split(':')
+        nickname = fields[0]
+        password = fields[1].replace('\n', '')
+        salt = password_salt()
+        pwdhash = password_hash(salt, password)
+        line = nickname + ' ' + salt + ' ' + pwdhash
+        filename = os.path.join(args.state_dir, 'passwords')
+        if os.path.isfile(filename):
+            if nickname + ' ' not in open(filename).read():
+                with open(filename, "a+") as fp:
+                    fp.write(line + '\n')
+        else:
+            with open(filename, "w+") as fp:
+                fp.write(line + ' oper\n')
+        sys.exit()
+
+    if args.del_account:
+        nickname = args.del_account.replace('\n', '')
+        filename = os.path.join(args.state_dir, 'passwords')
+        if os.path.isfile(filename):
+            if nickname + ' ' in open(filename).read():
+                new_passwords_file = ''
+                with open(filename, "r") as fp:
+                    lines = fp.readlines()
+                    new_passwords_file = ''
+                    for line in lines:
+                        if not line.startswith(nickname + ' '):
+                            if not line.endswith('\n'):
+                                line += '\n'
+                            new_passwords_file += line
+                with open(filename, "w+") as fp:
+                    fp.write(new_passwords_file)
+        sys.exit()
+
+    if args.set_password:
+        if ':' not in args.set_password:
+            args.error("Specify nickname:password")
+        fields = args.set_password.split(':')
+        nickname = fields[0]
+        password = fields[1].replace('\n', '')
+        filename = os.path.join(args.state_dir, 'passwords')
+        if os.path.isfile(filename):
+            if nickname + ' ' in open(filename).read():
+                new_passwords_file = ''
+                with open(filename, "r") as fp:
+                    lines = fp.readlines()
+                    new_passwords_file = ''
+                    for line in lines:
+                        if not line.endswith('\n'):
+                            line += '\n'
+                        if not line.startswith(nickname + ' '):
+                            new_passwords_file += line
+                        else:
+                            salt = line.split(' ')[1]
+                            pwdhash = password_hash(salt, password)
+                            new_line = nickname + ' ' + salt + ' ' + pwdhash
+                            if line.endswith(' oper\n'):
+                                new_line += ' oper'
+                            new_passwords_file += new_line + '\n'
+                with open(filename, "w+") as fp:
+                    fp.write(new_passwords_file)
+        sys.exit()
+
+    if bool(args.ssl_cert_file) != bool(args.ssl_key_file):
+        args.error("Must specify both --ssl-cert-file and --ssl-key-file")
+    if args.ssl_pem_file:
+        if args.ssl_cert_file:
+            args.error(
+                "Cannot specify both --ssl-pem-file and --ssl-cert-file"
+            )
+        args.ssl_cert_file = args.ssl_pem_file
+        args.ssl_key_file = args.ssl_pem_file
+
+    if os.name != "posix":
+        args.chroot = False
+        args.setuid = False
+    if args.debug:
+        args.verbose = True
+    if args.ports is None:
+        if args.ssl_key_file is None:
+            args.ports = "6667"
+        else:
+            args.ports = "6697"
+    if args.chroot and os.getuid() != 0:
+        ap.error("Must be root to use --chroot")
+    if args.setuid:
+        from pwd import getpwnam
+        from grp import getgrnam
+
+        if os.getuid() != 0:
+            ap.error("Must be root to use --setuid")
+        matches = args.setuid.split(":")
+        if len(matches) == 2:
+            args.setuid = (
+                getpwnam(matches[0]).pw_uid,
+                getgrnam(matches[1]).gr_gid,
+            )
+        elif len(matches) == 1:
+            args.setuid = (
+                getpwnam(matches[0]).pw_uid,
+                getpwnam(matches[0]).pw_gid,
+            )
+        else:
+            ap.error(
+                "Specify a user, or user and group separated by a colon,"
+                " e.g. --setuid daemon, --setuid nobody:nobody"
+            )
+    if (
+        os.name == "posix"
+        and not args.setuid
+        and (os.getuid() == 0 or os.getgid() == 0)
+    ):
+        ap.error(
+            "Running this service as root is not recommended. Use the"
+            " --setuid option to switch to an unprivileged account after"
+            " startup. If you really intend to run as root, use"
+            ' "--setuid root".'
+        )
+
+    ports = []
+    for port in re.split(r"[,\s]+", args.ports):
+        try:
+            ports.append(int(port))
+        except ValueError:
+            ap.error("bad port: %r" % port)
+    args.ports = ports
+    server = Server(args)
+    if args.pid_file:
+        args.pid_file = os.path.abspath(args.pid_file)
+    if args.daemon:
+        server.daemonize()
+    if args.pid_file:
+        server.make_pid_file(args.pid_file)
+    try:
+        server.start()
+    except KeyboardInterrupt:
+        server.print_error("Interrupted.")
+    finally:
+        if args.pid_file:
+            server.remove_pid_file(args.pid_file)
+
+
+if __name__ == "__main__":
+    main()
